@@ -763,72 +763,17 @@ final class VCP_Plugin {
             return ['ok' => false, 'message' => $message];
         }
 
-        $importResult = $this->import_passport_data_rows($baselineRows);
-        if (is_wp_error($importResult)) {
-            $wpdb->insert($this->table('baseline_import_log'), [
-                'status' => 'error',
-                'message' => $importResult->get_error_message(),
-                'rows_imported' => 0,
-            ]);
-
-            return ['ok' => false, 'message' => $importResult->get_error_message()];
-        }
-
-        $overrideResult = $this->cache_override_rows($overrideRows);
-        if (is_wp_error($overrideResult)) {
-            $wpdb->insert($this->table('baseline_import_log'), [
-                'status' => 'error',
-                'message' => $overrideResult->get_error_message(),
-                'rows_imported' => 0,
-            ]);
-
-            return ['ok' => false, 'message' => $overrideResult->get_error_message()];
-        }
-
-        $listResult = $this->cache_passport_lists($passportListRows);
-        if (is_wp_error($listResult)) {
-            $wpdb->insert($this->table('baseline_import_log'), [
-                'status' => 'error',
-                'message' => $listResult->get_error_message(),
-                'rows_imported' => 0,
-            ]);
-
-            return ['ok' => false, 'message' => $listResult->get_error_message()];
-        }
-
-        $imported = (int) $importResult['imported'];
-        $skipped = (int) $importResult['skipped'];
+        $imported = $this->import_passport_data_rows($baselineRows);
+        $this->cache_override_rows($overrideRows);
+        $this->cache_passport_lists($passportListRows);
 
         $wpdb->insert($this->table('baseline_import_log'), [
             'status' => 'success',
-            'message' => sprintf('Google Sheets sync completed. Imported: %d, skipped: %d.', $imported, $skipped),
+            'message' => 'Google Sheets sync completed.',
             'rows_imported' => $imported,
         ]);
 
-        return ['ok' => true, 'rows_imported' => $imported, 'rows_skipped' => $skipped];
-    }
-
-    private function normalize_sheet_headers($headers) {
-        $normalized = [];
-        foreach ($headers as $header) {
-            $key = strtolower(trim((string) $header));
-            $key = str_replace([' ', '-', '/'], '_', $key);
-            $normalized[] = preg_replace('/[^a-z0-9_]/', '', $key);
-        }
-
-        return $normalized;
-    }
-
-    private function assert_required_headers($sheetName, $headers, $required) {
-        $missing = array_values(array_diff($required, $headers));
-        if (!empty($missing)) {
-            return new WP_Error(
-                'vcp_sheet_missing_headers',
-                sprintf('%s is missing required headers: %s', $sheetName, implode(', ', $missing))
-            );
-        }
-
-        return true;
+        return ['ok' => true, 'rows_imported' => $imported];
     }
 
     private function build_google_service_jwt() {
@@ -936,35 +881,26 @@ final class VCP_Plugin {
         global $wpdb;
 
         if (count($rows) <= 1) {
-            return ['imported' => 0, 'skipped' => 0];
+            return 0;
         }
 
-        $headers = $this->normalize_sheet_headers($rows[0]);
-        $requiredHeaders = ['country_name', 'iso2', 'destinations'];
-        $headerCheck = $this->assert_required_headers('Main Passport Data', $headers, $requiredHeaders);
-        if (is_wp_error($headerCheck)) {
-            return $headerCheck;
-        }
-
+        $headers = array_map('trim', $rows[0]);
         $body = array_slice($rows, 1);
         $count = 0;
-        $skipped = 0;
 
         foreach ($body as $cells) {
             $row = $this->row_to_assoc($headers, $cells);
-            $country = sanitize_text_field($row['country_name'] ?? '');
-            $iso2 = strtoupper(sanitize_text_field($row['iso2'] ?? ''));
-            $destRaw = $row['destinations'] ?? '{}';
+            $country = sanitize_text_field($row['country_name'] ?? $row['country'] ?? '');
+            $iso2 = strtoupper(sanitize_text_field($row['iso2'] ?? $row['passport_iso2'] ?? ''));
+            $destRaw = $row['destinations'] ?? $row['destination_json'] ?? '{}';
 
             if (!$country || strlen($iso2) !== 2) {
-                $skipped++;
                 continue;
             }
 
-            $destinations = json_decode((string) $destRaw, true);
+            $destinations = is_array($destRaw) ? $destRaw : json_decode((string) $destRaw, true);
             if (!is_array($destinations)) {
-                $skipped++;
-                continue;
+                $destinations = [];
             }
 
             $wpdb->replace($this->table('passport_data'), [
@@ -977,30 +913,24 @@ final class VCP_Plugin {
             $count++;
         }
 
-        return ['imported' => $count, 'skipped' => $skipped];
+        return $count;
     }
 
     private function cache_override_rows($rows) {
         if (count($rows) <= 1) {
             set_transient('vcp_overrides_rules', [], WEEK_IN_SECONDS);
-            return ['cached' => 0];
+            return;
         }
 
-        $headers = $this->normalize_sheet_headers($rows[0]);
-        $requiredHeaders = ['passport_iso2', 'destination_iso2', 'res_bucket', 'doc_qualifier', 'passport_condition_type', 'passport_condition_list', 'result'];
-        $headerCheck = $this->assert_required_headers('VISA_OVERRIDES', $headers, $requiredHeaders);
-        if (is_wp_error($headerCheck)) {
-            return $headerCheck;
-        }
-
+        $headers = array_map('trim', $rows[0]);
         $body = array_slice($rows, 1);
         $rules = [];
 
         foreach ($body as $cells) {
             $row = $this->row_to_assoc($headers, $cells);
             $rules[] = [
-                'passport_iso2' => strtoupper(sanitize_text_field($row['passport_iso2'] ?? '')),
-                'destination_iso2' => strtoupper(sanitize_text_field($row['destination_iso2'] ?? '')),
+                'passport_iso2' => strtoupper(sanitize_text_field($row['passport_iso2'] ?? $row['passport'] ?? '')),
+                'destination_iso2' => strtoupper(sanitize_text_field($row['destination_iso2'] ?? $row['destination'] ?? '')),
                 'res_bucket' => strtoupper(sanitize_text_field($row['res_bucket'] ?? 'ANY')),
                 'doc_qualifier' => strtoupper(sanitize_text_field($row['doc_qualifier'] ?? 'ANY')),
                 'passport_condition_type' => strtoupper(sanitize_text_field($row['passport_condition_type'] ?? 'ALL')),
@@ -1010,36 +940,28 @@ final class VCP_Plugin {
         }
 
         set_transient('vcp_overrides_rules', $rules, WEEK_IN_SECONDS);
-        return ['cached' => count($rules)];
     }
 
     private function cache_passport_lists($rows) {
         if (count($rows) <= 1) {
             set_transient('vcp_passport_lists', [], WEEK_IN_SECONDS);
-            return ['cached' => 0];
+            return;
         }
 
-        $headers = $this->normalize_sheet_headers($rows[0]);
-        $requiredHeaders = ['iso2', 'res_bucket'];
-        $headerCheck = $this->assert_required_headers('PASSPORT_LISTS', $headers, $requiredHeaders);
-        if (is_wp_error($headerCheck)) {
-            return $headerCheck;
-        }
-
+        $headers = array_map('trim', $rows[0]);
         $body = array_slice($rows, 1);
         $map = [];
 
         foreach ($body as $cells) {
             $row = $this->row_to_assoc($headers, $cells);
-            $iso2 = strtoupper(sanitize_text_field($row['iso2'] ?? ''));
-            $bucket = strtoupper(sanitize_text_field($row['res_bucket'] ?? 'ANY'));
+            $iso2 = strtoupper(sanitize_text_field($row['iso2'] ?? $row['country_iso2'] ?? ''));
+            $bucket = strtoupper(sanitize_text_field($row['res_bucket'] ?? $row['bucket'] ?? 'ANY'));
             if (strlen($iso2) === 2) {
                 $map[$iso2] = $bucket;
             }
         }
 
         set_transient('vcp_passport_lists', $map, WEEK_IN_SECONDS);
-        return ['cached' => count($map)];
     }
 
     public function reload_visa_overrides() {
@@ -1058,12 +980,9 @@ final class VCP_Plugin {
             return ['ok' => false, 'message' => $overrideRows->get_error_message()];
         }
 
-        $cacheResult = $this->cache_override_rows($overrideRows);
-        if (is_wp_error($cacheResult)) {
-            return ['ok' => false, 'message' => $cacheResult->get_error_message()];
-        }
+        $this->cache_override_rows($overrideRows);
 
-        return ['ok' => true, 'message' => 'Overrides cache reloaded', 'rules_cached' => (int) $cacheResult['cached']];
+        return ['ok' => true, 'message' => 'Overrides cache reloaded'];
     }
 
     private function row_to_assoc($headers, $values) {
